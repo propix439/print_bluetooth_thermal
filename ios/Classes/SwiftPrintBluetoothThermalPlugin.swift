@@ -9,6 +9,9 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, FlutterPlugin, CBCentra
     private var output: CBCharacteristic?
     private var devices: [String] = []
     private var scanResult: FlutterResult?
+    private var scanWaiters: [FlutterResult] = []
+    private var pendingServices = 0
+    private var writableCandidates: [CBCharacteristic] = []
     private var connectResult: FlutterResult?
     private var writeResult: FlutterResult?
     private var pendingData = Data()
@@ -31,15 +34,20 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, FlutterPlugin, CBCentra
             result(Int(UIDevice.current.batteryLevel * 100))
         case "bluetoothenabled", "ispermissionbluetoothgranted": result(central.state == .poweredOn)
         case "pairedbluetooths":
-            guard central.state == .poweredOn, scanResult == nil else { result([String]()); return }
+            if scanResult != nil { scanWaiters.append(result); return }
+            guard central.state == .poweredOn || central.state == .unknown || central.state == .resetting else { result([String]()); return }
             devices = []
             scanResult = result
-            central.scanForPeripherals(withServices: nil)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+            if let peripheral = printer, peripheral.state == .connected { addDevice(peripheral, name: peripheral.name) }
+            if central.state == .poweredOn { central.scanForPeripherals(withServices: nil) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
                 self.central.stopScan()
                 let completion = self.scanResult
                 self.scanResult = nil
                 completion?(self.devices)
+                let waiters = self.scanWaiters
+                self.scanWaiters = []
+                for waiter in waiters { waiter(self.devices) }
             }
         case "connect":
             guard let address = call.arguments as? String, let id = UUID(uuidString: address),
@@ -49,8 +57,12 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, FlutterPlugin, CBCentra
             if printer?.identifier == id, printer?.state == .connected, output != nil {
                 result(true); return
             }
-            if let previous = printer { central.cancelPeripheralConnection(previous) }
+            if let previous = printer, previous.identifier != id {
+                central.cancelPeripheralConnection(previous)
+            }
             output = nil
+            pendingServices = 0
+            writableCandidates = []
             guard let peripheral = central.retrievePeripherals(withIdentifiers: [id]).first else {
                 printer = nil; result(false); return
             }
@@ -167,9 +179,15 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, FlutterPlugin, CBCentra
 
     public func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                                advertisementData: [String: Any], rssi RSSI: NSNumber) {
-        guard let name = peripheral.name else { return }
+        addDevice(peripheral, name: peripheral.name ?? advertisementData[CBAdvertisementDataLocalNameKey] as? String)
+    }
+
+    private func addDevice(_ peripheral: CBPeripheral, name: String?) {
+        let name = name ?? "Bluetooth device"
         let device = "\(name)#\(peripheral.identifier.uuidString)"
-        if !devices.contains(device) { devices.append(device) }
+        let suffix = "#\(peripheral.identifier.uuidString)"
+        devices.removeAll { $0.hasSuffix(suffix) }
+        devices.append(device)
     }
 
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
@@ -193,23 +211,43 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, FlutterPlugin, CBCentra
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard peripheral == printer else { return }
         guard error == nil, let services = peripheral.services, !services.isEmpty else { finishConnect(false); return }
+        pendingServices = services.count
+        writableCandidates = []
         for service in services { peripheral.discoverCharacteristics(nil, for: service) }
     }
 
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        guard peripheral == printer, error == nil, output == nil else { return }
+        guard peripheral == printer, connectResult != nil, output == nil else { return }
+        pendingServices -= 1
+        if error == nil {
+            writableCandidates += (service.characteristics ?? []).filter {
+                $0.properties.contains(.write) || $0.properties.contains(.writeWithoutResponse)
+            }
+        }
         // Known printer endpoints, including common FFE0/FFE1 and 18F0/2AF1 devices.
         let ids = ["00001101-0000-1000-8000-00805F9B34FB", "49535343-8841-43F4-A8D4-ECBE34729BB3",
                    "A76EB9E2-F3AC-4990-84CF-3A94D2426B2B", "FFE1", "2AF1", "FF02"]
-        if let characteristic = service.characteristics?.first(where: {
+        if let characteristic = writableCandidates.first(where: {
             ids.contains($0.uuid.uuidString) && ($0.properties.contains(.write) || $0.properties.contains(.writeWithoutResponse))
         }) {
             output = characteristic
             finishConnect(true)
+        } else if pendingServices == 0 {
+            // Unlisted models are safe to use automatically only when their
+            // services expose a single writable endpoint.
+            if writableCandidates.count == 1 {
+                output = writableCandidates[0]
+                finishConnect(true)
+            } else {
+                finishConnect(false)
+            }
         }
     }
 
     public func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        if central.state == .poweredOn, scanResult != nil {
+            central.scanForPeripherals(withServices: nil)
+        }
         if central.state != .poweredOn {
             output = nil
             finishConnect(false)

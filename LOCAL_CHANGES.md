@@ -9,6 +9,9 @@ iOS fixes:
 - Complete each write Future once after the whole payload has been submitted.
 - Separate connection, scan, and write callbacks and add bounded waits.
 - Send text through the same write path.
+- Wait for Bluetooth initialization before scanning, share concurrent scans,
+  include connected and unnamed peripherals, and scan for ten seconds.
+- Support unlisted printer models when there is exactly one writable endpoint.
 
 This fork retains CocoaPods integration. Upstream 1.2.2+ switches Apple support
 to Swift Package Manager, requiring a separate Flutter/build migration review.
